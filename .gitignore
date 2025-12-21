@@ -5,3 +5,11 @@ dist/
 *.d.ts
 !jest.config.js
 !frontend/src/js/*.js
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
