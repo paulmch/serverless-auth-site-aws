@@ -248,6 +248,26 @@ aws cognito-idp admin-create-user \
   --temporary-password "TempPass123!"
 ```
 
+## Running Tests
+
+```bash
+# Install test dependencies
+pip install -r tests/requirements.txt
+
+# Run all tests
+pytest
+
+# Run with coverage
+pytest --cov=lambda --cov-report=html
+
+# Run specific test file
+pytest tests/test_authorizer.py -v
+```
+
+Tests cover the security-critical paths:
+- **Authorizer logic**: JWT validation, session lookup, edge cases
+- **Session lifecycle**: Create, access, refresh, expire
+
 ## Cleanup
 
 ```bash
