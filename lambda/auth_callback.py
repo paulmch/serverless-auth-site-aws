@@ -15,6 +15,18 @@ from jose import jwt
 dynamodb = boto3.resource('dynamodb')
 
 
+def get_security_headers() -> Dict[str, str]:
+    """
+    Return security headers following OWASP best practices.
+    """
+    return {
+        'X-Frame-Options': 'DENY',
+        'X-Content-Type-Options': 'nosniff',
+        'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+        'X-XSS-Protection': '1; mode=block',
+    }
+
+
 def exchange_code_for_tokens(code: str, redirect_uri: str) -> Dict[str, Any]:
     """Exchange authorization code for tokens with Cognito."""
     cognito_domain = os.environ.get('COGNITO_DOMAIN')
@@ -97,7 +109,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'statusCode': 400,
                 'headers': {
                     'Content-Type': 'text/html',
-                    'Cache-Control': 'no-cache, no-store, must-revalidate'
+                    'Cache-Control': 'no-cache, no-store, must-revalidate',
+                    **get_security_headers()
                 },
                 'body': f"""
                     <!DOCTYPE html>
@@ -124,7 +137,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if not code:
             return {
                 'statusCode': 400,
-                'headers': {'Content-Type': 'text/plain'},
+                'headers': {
+                    'Content-Type': 'text/plain',
+                    **get_security_headers()
+                },
                 'body': 'Missing authorization code'
             }
 
@@ -178,7 +194,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 },
                 'headers': {
                     'Location': redirect_location,
-                    'Cache-Control': 'no-cache, no-store, must-revalidate'
+                    'Cache-Control': 'no-cache, no-store, must-revalidate',
+                    **get_security_headers()
                 },
                 'body': ''
             }
@@ -189,7 +206,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'statusCode': 500,
                 'headers': {
                     'Content-Type': 'text/html',
-                    'Cache-Control': 'no-cache, no-store, must-revalidate'
+                    'Cache-Control': 'no-cache, no-store, must-revalidate',
+                    **get_security_headers()
                 },
                 'body': """
                     <!DOCTYPE html>
@@ -216,6 +234,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         print(f"Auth callback error: {str(e)}")
         return {
             'statusCode': 500,
-            'headers': {'Content-Type': 'text/plain'},
+            'headers': {
+                'Content-Type': 'text/plain',
+                **get_security_headers()
+            },
             'body': 'Internal server error'
         }

@@ -263,21 +263,76 @@ export class SecureStaticSiteStack extends cdk.Stack {
       layers: [dependenciesLayer],
     });
 
+    /**
+     * Logout Lambda Function
+     * - Handles user logout requests
+     * - Deletes session from DynamoDB
+     * - Clears session cookie
+     */
+    const logoutLambda = new lambda.Function(this, 'LogoutFunction', {
+      runtime: lambda.Runtime.PYTHON_3_11,
+      handler: 'logout.handler',
+      code: lambda.Code.fromAsset(path.join(__dirname, '../lambda')),
+      environment: commonLambdaEnv,
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 256,
+      description: 'Handles user logout and session cleanup',
+      layers: [dependenciesLayer],
+    });
+
     // ===========================
     // IAM PERMISSIONS
     // ===========================
 
     /**
      * Grant DynamoDB access to all auth-related Lambdas
-     * - Authorizer: reads session to validate tokens
+     * Following principle of least privilege - each Lambda gets only required permissions
+     * - Authorizer: reads session to validate tokens, updates lastAccessedAt
      * - Auth Callback: creates session after OAuth callback
      * - Auth Decider: reads/updates session for token refresh
      * - API Lambda: reads session for user info endpoint
      */
-    userSessionsTable.grantReadWriteData(authorizerLambda);
-    userSessionsTable.grantReadWriteData(authCallbackLambda);
-    userSessionsTable.grantReadWriteData(authDeciderLambda);
+
+    // Authorizer: only needs GetItem and UpdateItem
+    authorizerLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'dynamodb:GetItem',
+        'dynamodb:UpdateItem'
+      ],
+      resources: [userSessionsTable.tableArn]
+    }));
+
+    // Auth Callback: only needs PutItem to create new sessions
+    authCallbackLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'dynamodb:PutItem'
+      ],
+      resources: [userSessionsTable.tableArn]
+    }));
+
+    // Auth Decider: only needs GetItem and UpdateItem for token refresh
+    authDeciderLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'dynamodb:GetItem',
+        'dynamodb:UpdateItem'
+      ],
+      resources: [userSessionsTable.tableArn]
+    }));
+
+    // API Lambda: full access for user info endpoint
     userSessionsTable.grantReadWriteData(apiLambda);
+
+    // Logout Lambda: only needs DeleteItem to remove sessions
+    logoutLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'dynamodb:DeleteItem'
+      ],
+      resources: [userSessionsTable.tableArn]
+    }));
 
     /**
      * Grant authorizer Lambda access to Cognito
@@ -313,17 +368,21 @@ export class SecureStaticSiteStack extends cdk.Stack {
     /**
      * API Gateway REST API
      * - Entry point for all traffic
-     * - CORS enabled for all origins (configure as needed)
+     * - CORS configured securely with restricted methods
      * - Handles both static files and API endpoints
      */
     const api = new apigateway.RestApi(this, 'StaticSiteApi', {
       restApiName: 'Serverless Auth Site API',
       description: 'API Gateway for serverless authenticated static site with Cognito',
       defaultCorsPreflightOptions: {
-        allowOrigins: apigateway.Cors.ALL_ORIGINS,
-        allowMethods: apigateway.Cors.ALL_METHODS,
-        allowHeaders: ['Content-Type', 'Authorization', 'Cookie'],
+        // Restrict to only necessary HTTP methods
+        allowMethods: ['GET', 'POST', 'OPTIONS'],
+        // Only allow necessary headers
+        allowHeaders: ['Content-Type', 'Cookie'],
         allowCredentials: true,
+        // Since frontend is served from same API Gateway, same-origin policy applies
+        // For stricter security, this could be further restricted per environment
+        allowOrigins: apigateway.Cors.ALL_ORIGINS,
       },
       binaryMediaTypes: ['*/*'],
     });
@@ -407,6 +466,7 @@ export class SecureStaticSiteStack extends cdk.Stack {
      * - /api/auth/user: Get current user information
      * - /api/auth/check: Check authentication status
      * - /api/auth/refresh: Refresh access tokens
+     * - /api/auth/logout: Logout and clear session
      */
     const apiResource = api.root.addResource('api');
 
@@ -421,6 +481,10 @@ export class SecureStaticSiteStack extends cdk.Stack {
       });
     authApiResource.addResource('refresh').addMethod('POST',
       new apigateway.LambdaIntegration(apiLambda), {
+        authorizer: lambdaAuthorizer,
+      });
+    authApiResource.addResource('logout').addMethod('POST',
+      new apigateway.LambdaIntegration(logoutLambda), {
         authorizer: lambdaAuthorizer,
       });
 
@@ -494,6 +558,11 @@ export class SecureStaticSiteStack extends cdk.Stack {
             statusCode: '200',
             responseParameters: {
               'method.response.header.Content-Type': "'text/html'",
+              'method.response.header.X-Frame-Options': "'DENY'",
+              'method.response.header.X-Content-Type-Options': "'nosniff'",
+              'method.response.header.Strict-Transport-Security': "'max-age=31536000; includeSubDomains'",
+              'method.response.header.X-XSS-Protection': "'1; mode=block'",
+              'method.response.header.Cache-Control': "'no-cache, no-store, must-revalidate'",
             },
           },
         ],
@@ -507,6 +576,11 @@ export class SecureStaticSiteStack extends cdk.Stack {
           statusCode: '200',
           responseParameters: {
             'method.response.header.Content-Type': true,
+            'method.response.header.X-Frame-Options': true,
+            'method.response.header.X-Content-Type-Options': true,
+            'method.response.header.Strict-Transport-Security': true,
+            'method.response.header.X-XSS-Protection': true,
+            'method.response.header.Cache-Control': true,
           },
         },
       ],
@@ -535,6 +609,8 @@ export class SecureStaticSiteStack extends cdk.Stack {
             responseParameters: {
               'method.response.header.Content-Type': "'text/css'",
               'method.response.header.Cache-Control': "'public, max-age=3600'",
+              'method.response.header.X-Content-Type-Options': "'nosniff'",
+              'method.response.header.Strict-Transport-Security': "'max-age=31536000; includeSubDomains'",
             },
           },
         ],
@@ -550,6 +626,8 @@ export class SecureStaticSiteStack extends cdk.Stack {
           responseParameters: {
             'method.response.header.Content-Type': true,
             'method.response.header.Cache-Control': true,
+            'method.response.header.X-Content-Type-Options': true,
+            'method.response.header.Strict-Transport-Security': true,
           },
         },
       ],
@@ -578,6 +656,8 @@ export class SecureStaticSiteStack extends cdk.Stack {
             responseParameters: {
               'method.response.header.Content-Type': "'application/javascript'",
               'method.response.header.Cache-Control': "'public, max-age=3600'",
+              'method.response.header.X-Content-Type-Options': "'nosniff'",
+              'method.response.header.Strict-Transport-Security': "'max-age=31536000; includeSubDomains'",
             },
           },
         ],
@@ -593,6 +673,8 @@ export class SecureStaticSiteStack extends cdk.Stack {
           responseParameters: {
             'method.response.header.Content-Type': true,
             'method.response.header.Cache-Control': true,
+            'method.response.header.X-Content-Type-Options': true,
+            'method.response.header.Strict-Transport-Security': true,
           },
         },
       ],
