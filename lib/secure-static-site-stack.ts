@@ -269,14 +269,43 @@ export class SecureStaticSiteStack extends cdk.Stack {
 
     /**
      * Grant DynamoDB access to all auth-related Lambdas
-     * - Authorizer: reads session to validate tokens
+     * Following principle of least privilege - each Lambda gets only required permissions
+     * - Authorizer: reads session to validate tokens, updates lastAccessedAt
      * - Auth Callback: creates session after OAuth callback
      * - Auth Decider: reads/updates session for token refresh
      * - API Lambda: reads session for user info endpoint
      */
-    userSessionsTable.grantReadWriteData(authorizerLambda);
-    userSessionsTable.grantReadWriteData(authCallbackLambda);
-    userSessionsTable.grantReadWriteData(authDeciderLambda);
+
+    // Authorizer: only needs GetItem and UpdateItem
+    authorizerLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'dynamodb:GetItem',
+        'dynamodb:UpdateItem'
+      ],
+      resources: [userSessionsTable.tableArn]
+    }));
+
+    // Auth Callback: only needs PutItem to create new sessions
+    authCallbackLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'dynamodb:PutItem'
+      ],
+      resources: [userSessionsTable.tableArn]
+    }));
+
+    // Auth Decider: only needs GetItem and UpdateItem for token refresh
+    authDeciderLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'dynamodb:GetItem',
+        'dynamodb:UpdateItem'
+      ],
+      resources: [userSessionsTable.tableArn]
+    }));
+
+    // API Lambda: full access for user info endpoint
     userSessionsTable.grantReadWriteData(apiLambda);
 
     /**
