@@ -13,24 +13,12 @@ import os
 from typing import Dict, Any
 import boto3
 
+from security_headers import get_security_headers
+
 # Initialize DynamoDB client
 dynamodb = boto3.resource('dynamodb')
 table_name = os.environ.get('USER_SESSIONS_TABLE', 'static-site-sessions')
 table = dynamodb.Table(table_name)
-
-
-def get_security_headers() -> Dict[str, str]:
-    """
-    Return security headers following OWASP best practices.
-    """
-    return {
-        'X-Frame-Options': 'DENY',
-        'X-Content-Type-Options': 'nosniff',
-        'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
-        'X-XSS-Protection': '1; mode=block',
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-        'Pragma': 'no-cache'
-    }
 
 
 def extract_session_id(event: Dict[str, Any]) -> str:
@@ -65,7 +53,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     4. Return success response
     """
 
-    print(f"Logout request received")
+    print("Logout request received")
 
     # Extract session ID from cookie
     session_id = extract_session_id(event)
@@ -91,7 +79,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         table.delete_item(
             Key={'sessionId': session_id}
         )
-        print(f"Session {session_id} deleted from DynamoDB")
+        # Log a prefix only - a full session ID in CloudWatch is a live credential.
+        print(f"Session {session_id[:8]}... deleted from DynamoDB")
     except Exception as e:
         # Log error but still clear cookie (best effort)
         print(f"Error deleting session from DynamoDB: {str(e)}")

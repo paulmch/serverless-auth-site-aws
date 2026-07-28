@@ -57,6 +57,19 @@ This project uses API Gateway's free HTTPS URL + Cognito's hosted login UI.
 - AWS WAF (Web Application Firewall)
 - Custom domain + ACM certificate
 
+**What's already in place:**
+- Server-side sessions - tokens never reach the browser
+- OAuth `state` nonce validation on the callback (login CSRF)
+- Same-origin-only redirect targets (open redirect)
+- Content-Security-Policy, HSTS, `X-Frame-Options: DENY`, `nosniff`, `no-referrer`
+- Stage-level throttling on the unauthenticated auth endpoints
+- Least-privilege IAM per Lambda, and no S3 public access
+
+The unauthenticated endpoints are throttled per method at the stage, which
+applies to every caller. Note this is a throughput limit, not a daily cap -
+API Gateway can only express quotas per API key. If you need a hard ceiling on
+public traffic, put AWS WAF in front of the API.
+
 ## Server-Side Session Storage
 
 Tokens are stored securely in DynamoDB, **not in browser cookies**:
@@ -219,6 +232,33 @@ The Lambda authorizer handles edge cases that trip up most implementations:
 
 See `lambda/authorizer.py` for the implementation.
 
+## Login Flow
+
+Always enter the login flow at `/auth/decider` (the `LoginUrl` stack output).
+Unauthenticated requests land there automatically: API Gateway's 401 and 403
+gateway responses redirect to it.
+
+```
+/auth/decider                     /auth/callback
+     │                                  │
+     ├─ mints state nonce               ├─ requires nonce to match cookie
+     ├─ sets oauth_state cookie         ├─ exchanges code for tokens
+     └─ redirects to Cognito ──────────▶└─ sets session_id, returns to origin
+```
+
+The `state` parameter carries a random nonce plus the page the user was trying
+to reach. `/auth/callback` refuses to exchange the authorization code unless the
+returned nonce matches the `oauth_state` HttpOnly cookie, which is what stops an
+attacker from completing a login flow in someone else's browser and silently
+signing them into the attacker's account.
+
+A hand-built Cognito hosted-UI URL carries no state and will be rejected. If you
+need one (for example to link an identity provider directly), route it through
+the decider instead.
+
+Redirect targets are constrained to same-origin paths, so neither endpoint can
+be used as an open redirect.
+
 ## Project Structure
 
 ```
@@ -227,13 +267,18 @@ See `lambda/authorizer.py` for the implementation.
 ├── lambda/
 │   ├── authorizer.py                 # JWT verification
 │   ├── auth_callback.py              # OAuth2 callback
-│   ├── auth_decider.py               # Token refresh logic
+│   ├── auth_decider.py               # Token refresh / login redirect
+│   ├── logout.py                     # Session teardown
 │   ├── api_handler.py                # Example API
-│   └── update_cognito_urls.py        # URL configuration
+│   ├── oauth_state.py                # OAuth state + redirect validation
+│   ├── security_headers.py           # Shared response headers
+│   └── update_cognito_urls.py        # Post-deploy URL configuration
 ├── frontend/
 │   └── src/                          # Static files
-└── bin/
-    └── app.ts                        # CDK entry point
+├── tests/                            # Lambda unit tests
+├── bin/
+│   └── app.ts                        # CDK entry point
+└── .github/workflows/ci.yml          # Tests, typecheck, synth, audit
 ```
 
 ## Adding Users
@@ -267,6 +312,22 @@ pytest tests/test_authorizer.py -v
 Tests cover the security-critical paths:
 - **Authorizer logic**: JWT validation, session lookup, edge cases
 - **Session lifecycle**: Create, access, refresh, expire
+- **OAuth state**: CSRF nonce validation, open-redirect rejection, output escaping
+
+To check the infrastructure:
+
+```bash
+npm ci             # fails if the lockfile has drifted from package.json
+npm run typecheck
+npm run synth      # renders the CloudFormation template
+```
+
+`cdk synth` bundles the Lambda layer with a local `pip` when one is available
+and falls back to Docker otherwise, so neither a daemon nor a matching host
+Python is required. Wheels are always resolved for the Lambda target platform,
+not the build host.
+
+All of the above run in CI on every push and pull request.
 
 ## Cleanup
 

@@ -4,17 +4,23 @@
   "description": "Serverless authenticated static site on AWS with Cognito, server-side sessions, and zero infrastructure to manage",
   "scripts": {
     "build": "tsc",
+    "typecheck": "tsc --noEmit",
     "cdk": "cdk",
+    "synth": "cdk synth",
     "deploy": "cdk deploy",
-    "destroy": "cdk destroy"
+    "destroy": "cdk destroy",
+    "test": "pytest"
+  },
+  "engines": {
+    "node": ">=22"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "aws-cdk": "^2.1100.0",
-    "typescript": "^5.9.0"
+    "@types/node": "^22.20.1",
+    "aws-cdk": "^2.1133.0",
+    "typescript": "^5.9.3"
   },
   "dependencies": {
-    "aws-cdk-lib": "^2.233.0",
-    "constructs": "^10.4.0"
+    "aws-cdk-lib": "^2.262.1",
+    "constructs": "^10.4.4"
   }
 }

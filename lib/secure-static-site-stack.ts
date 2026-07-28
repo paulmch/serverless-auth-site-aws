@@ -5,10 +5,88 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as logs from 'aws-cdk-lib/aws-logs';
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
 import * as triggers from "aws-cdk-lib/triggers";
 import { Construct } from 'constructs';
+import { execFileSync } from 'child_process';
+import { createHash } from 'crypto';
+import * as fs from 'fs';
 import * as path from 'path';
+
+const FRONTEND_DIR = path.join(__dirname, '../frontend/src');
+
+/**
+ * Read index.html and inject its Content-Security-Policy as a meta tag.
+ *
+ * The policy is delivered in the markup rather than as an API Gateway response
+ * header because CSP keywords are single-quoted (`'self'`), and API Gateway's
+ * static response parameter values are themselves delimited by single quotes
+ * with no documented escape. `frame-ancestors` is the one directive a meta tag
+ * cannot carry, so framing is denied by the `X-Frame-Options: DENY` header the
+ * integration response sets instead.
+ *
+ * index.html needs one inline script - it sets `<base href>` before the
+ * stylesheet link is parsed, so it cannot move to an external file. Rather than
+ * weakening the policy with 'unsafe-inline', its SHA-256 is computed here at
+ * synth time and whitelisted by hash, so editing that script updates the policy
+ * automatically instead of silently breaking the page.
+ */
+function indexHtmlWithCsp(): string {
+  const html = fs.readFileSync(path.join(FRONTEND_DIR, 'index.html'), 'utf8');
+
+  // The single inline <script> block - i.e. the one without a src attribute.
+  const inlineScripts = [...html.matchAll(/<script(?![^>]*\ssrc=)[^>]*>([\s\S]*?)<\/script>/gi)];
+  if (inlineScripts.length !== 1) {
+    throw new Error(
+      `Expected exactly 1 inline script in index.html, found ${inlineScripts.length}. ` +
+      'Update indexHtmlWithCsp() to hash each of them.',
+    );
+  }
+
+  const digest = createHash('sha256').update(inlineScripts[0][1], 'utf8').digest('base64');
+
+  const policy = [
+    "default-src 'none'",
+    `script-src 'self' 'sha256-${digest}'`,
+    "style-src 'self'",
+    "connect-src 'self'",
+    "img-src 'self' data:",
+    "base-uri 'self'",
+    "form-action 'none'",
+  ].join('; ');
+
+  const meta = `<meta http-equiv="Content-Security-Policy" content="${policy}">`;
+
+  // Injected after the charset declaration, which must stay first, and before
+  // the inline script, which the policy has to cover.
+  const charsetMeta = /<meta\s+charset=["'][^"']*["']\s*\/?>/i;
+  if (!charsetMeta.test(html)) {
+    throw new Error('index.html has no <meta charset> to anchor the CSP injection to.');
+  }
+
+  return html.replace(charsetMeta, (match) => `${match}\n    ${meta}`);
+}
+
+/**
+ * Python runtime for all Lambda functions.
+ *
+ * Kept on a single constant so the whole stack moves together. Runs on Amazon
+ * Linux 2023 - the python3.11 runtime is built on Amazon Linux 2, which reached
+ * end of life on 2026-06-30.
+ */
+const PYTHON_RUNTIME = lambda.Runtime.PYTHON_3_13;
+
+/** Wheel tags matching PYTHON_RUNTIME, used when bundling the layer locally. */
+const LAMBDA_PYTHON_VERSION = '3.13';
+const LAMBDA_WHEEL_PLATFORM = 'manylinux2014_x86_64';
+
+/**
+ * Sustained request rate and burst allowance for the unauthenticated auth
+ * endpoints (/auth/callback and /auth/decider).
+ */
+const PUBLIC_ENDPOINT_RATE_LIMIT = 1;
+const PUBLIC_ENDPOINT_BURST_LIMIT = 2;
 
 /**
  * Secure Static Site Stack
@@ -162,18 +240,48 @@ export class SecureStaticSiteStack extends cdk.Stack {
      * Lambda layer containing Python dependencies
      * - Shared across all Lambda functions
      * - Includes JWT handling, HTTP clients, etc.
+     *
+     * Bundling prefers a local `pip` and falls back to Docker when pip is
+     * unavailable, so `cdk synth` works on machines (and CI runners) without a
+     * Docker daemon. The local path pins the wheel platform to the Lambda
+     * target rather than the host, so a build on macOS or arm64 still produces
+     * the manylinux x86-64 binaries the runtime needs - `cryptography` ships
+     * native code, and host-native wheels would fail to import at runtime.
      */
     const dependenciesLayer = new lambda.LayerVersion(this, 'DependenciesLayer', {
       code: lambda.Code.fromAsset(path.join(__dirname, '../lambda'), {
         bundling: {
-          image: lambda.Runtime.PYTHON_3_11.bundlingImage,
+          image: PYTHON_RUNTIME.bundlingImage,
           command: [
             'bash', '-c',
             'pip install -r requirements.txt -t /asset-output/python'
           ],
+          local: {
+            tryBundle(outputDir: string): boolean {
+              const requirements = path.join(__dirname, '../lambda/requirements.txt');
+              try {
+                execFileSync('python3', [
+                  '-m', 'pip', 'install',
+                  '-r', requirements,
+                  '-t', path.join(outputDir, 'python'),
+                  // Resolve wheels for the Lambda runtime, not the build host.
+                  '--platform', LAMBDA_WHEEL_PLATFORM,
+                  '--python-version', LAMBDA_PYTHON_VERSION,
+                  '--implementation', 'cp',
+                  '--only-binary=:all:',
+                  '--upgrade',
+                  '--quiet',
+                ], { stdio: 'inherit' });
+                return true;
+              } catch {
+                // pip missing or resolution failed - let CDK use Docker.
+                return false;
+              }
+            },
+          },
         },
       }),
-      compatibleRuntimes: [lambda.Runtime.PYTHON_3_11],
+      compatibleRuntimes: [PYTHON_RUNTIME],
       description: 'Dependencies for Lambda functions',
     });
 
@@ -196,13 +304,26 @@ export class SecureStaticSiteStack extends cdk.Stack {
     };
 
     /**
+     * Explicit log group for a Lambda function.
+     *
+     * Log groups that Lambda creates implicitly retain records forever, which
+     * quietly accrues CloudWatch storage cost on a project whose whole premise
+     * is a near-zero bill. These expire after a month and are removed with the
+     * stack.
+     */
+    const makeLogGroup = (id: string) => new logs.LogGroup(this, id, {
+      retention: logs.RetentionDays.ONE_MONTH,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    /**
      * Lambda Authorizer Function
      * - Validates JWT tokens from Cognito
      * - Returns IAM policy for API Gateway
      * - No caching to ensure fresh authorization checks
      */
     const authorizerLambda = new lambda.Function(this, 'AuthorizerFunction', {
-      runtime: lambda.Runtime.PYTHON_3_11,
+      runtime: PYTHON_RUNTIME,
       handler: 'authorizer.handler',
       code: lambda.Code.fromAsset(path.join(__dirname, '../lambda')),
       layers: [dependenciesLayer],
@@ -210,6 +331,7 @@ export class SecureStaticSiteStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(30),
       memorySize: 512,
       description: 'JWT authorizer for API Gateway',
+      logGroup: makeLogGroup('AuthorizerLogGroup'),
     });
 
     /**
@@ -219,7 +341,7 @@ export class SecureStaticSiteStack extends cdk.Stack {
      * - Stores tokens in DynamoDB, sets session cookie
      */
     const authCallbackLambda = new lambda.Function(this, 'AuthCallbackFunction', {
-      runtime: lambda.Runtime.PYTHON_3_11,
+      runtime: PYTHON_RUNTIME,
       handler: 'auth_callback.handler',
       code: lambda.Code.fromAsset(path.join(__dirname, '../lambda')),
       layers: [dependenciesLayer],  // Needs jose for JWT decoding
@@ -227,6 +349,7 @@ export class SecureStaticSiteStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(30),
       memorySize: 256,
       description: 'OAuth2 callback handler - stores tokens server-side',
+      logGroup: makeLogGroup('AuthCallbackLogGroup'),
     });
 
     /**
@@ -236,7 +359,7 @@ export class SecureStaticSiteStack extends cdk.Stack {
      * - Refreshes tokens and updates DynamoDB
      */
     const authDeciderLambda = new lambda.Function(this, 'AuthDeciderFunction', {
-      runtime: lambda.Runtime.PYTHON_3_11,
+      runtime: PYTHON_RUNTIME,
       handler: 'auth_decider.handler',
       code: lambda.Code.fromAsset(path.join(__dirname, '../lambda')),
       layers: [dependenciesLayer],  // Needs jose for JWT decoding
@@ -244,6 +367,7 @@ export class SecureStaticSiteStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(30),
       memorySize: 256,
       description: 'Token refresh handler - updates tokens in DynamoDB',
+      logGroup: makeLogGroup('AuthDeciderLogGroup'),
     });
 
     /**
@@ -253,13 +377,14 @@ export class SecureStaticSiteStack extends cdk.Stack {
      * - Access to sessions table for state management
      */
     const apiLambda = new lambda.Function(this, 'ApiFunction', {
-      runtime: lambda.Runtime.PYTHON_3_11,
+      runtime: PYTHON_RUNTIME,
       handler: 'api_handler.handler',
       code: lambda.Code.fromAsset(path.join(__dirname, '../lambda')),
       environment: commonLambdaEnv,
       timeout: cdk.Duration.seconds(30),
       memorySize: 512,
       description: 'Main API handler for auth endpoints',
+      logGroup: makeLogGroup('ApiFunctionLogGroup'),
       layers: [dependenciesLayer],
     });
 
@@ -270,13 +395,14 @@ export class SecureStaticSiteStack extends cdk.Stack {
      * - Clears session cookie
      */
     const logoutLambda = new lambda.Function(this, 'LogoutFunction', {
-      runtime: lambda.Runtime.PYTHON_3_11,
+      runtime: PYTHON_RUNTIME,
       handler: 'logout.handler',
       code: lambda.Code.fromAsset(path.join(__dirname, '../lambda')),
       environment: commonLambdaEnv,
       timeout: cdk.Duration.seconds(30),
       memorySize: 256,
       description: 'Handles user logout and session cleanup',
+      logGroup: makeLogGroup('LogoutLogGroup'),
       layers: [dependenciesLayer],
     });
 
@@ -374,17 +500,33 @@ export class SecureStaticSiteStack extends cdk.Stack {
     const api = new apigateway.RestApi(this, 'StaticSiteApi', {
       restApiName: 'Serverless Auth Site API',
       description: 'API Gateway for serverless authenticated static site with Cognito',
-      defaultCorsPreflightOptions: {
-        // Restrict to only necessary HTTP methods
-        allowMethods: ['GET', 'POST', 'OPTIONS'],
-        // Only allow necessary headers
-        allowHeaders: ['Content-Type', 'Cookie'],
-        allowCredentials: true,
-        // Since frontend is served from same API Gateway, same-origin policy applies
-        // For stricter security, this could be further restricted per environment
-        allowOrigins: apigateway.Cors.ALL_ORIGINS,
-      },
+      // No defaultCorsPreflightOptions: the frontend is served from this same
+      // API Gateway origin, so every browser call is same-origin and no CORS
+      // preflight is involved. The previous configuration paired
+      // `Access-Control-Allow-Origin: *` with
+      // `Access-Control-Allow-Credentials: true`, which browsers reject outright
+      // for credentialed requests - and, had a browser honoured it, would have
+      // let any site on the internet read authenticated responses.
+      //
+      // To serve the frontend from a different origin, add
+      // `defaultCorsPreflightOptions` here with an explicit `allowOrigins` list
+      // naming that origin. Never combine `allowCredentials` with a wildcard.
       binaryMediaTypes: ['*/*'],
+      deployOptions: {
+        // Method-level throttling on the stage. Unlike usage plan throttling,
+        // this applies to every caller rather than only to requests carrying an
+        // API key - see the rate limiting section below.
+        methodOptions: {
+          '/auth/callback/GET': {
+            throttlingRateLimit: PUBLIC_ENDPOINT_RATE_LIMIT,
+            throttlingBurstLimit: PUBLIC_ENDPOINT_BURST_LIMIT,
+          },
+          '/auth/decider/GET': {
+            throttlingRateLimit: PUBLIC_ENDPOINT_RATE_LIMIT,
+            throttlingBurstLimit: PUBLIC_ENDPOINT_BURST_LIMIT,
+          },
+        },
+      },
     });
 
     // ===========================
@@ -455,10 +597,10 @@ export class SecureStaticSiteStack extends cdk.Stack {
      * - /auth/decider: Token refresh or login redirect logic
      */
     const authResource = api.root.addResource('auth');
-    const authCallbackMethod = authResource.addResource('callback').addMethod('GET',
+    authResource.addResource('callback').addMethod('GET',
       new apigateway.LambdaIntegration(authCallbackLambda));
 
-    const authDeciderMethod = authResource.addResource('decider').addMethod('GET',
+    authResource.addResource('decider').addMethod('GET',
       new apigateway.LambdaIntegration(authDeciderLambda));
 
     /**
@@ -493,49 +635,23 @@ export class SecureStaticSiteStack extends cdk.Stack {
     // ===========================
 
     /**
-     * Usage Plan for Rate Limiting
-     * - Protects public auth endpoints from abuse
-     * - 1 request/second sustained rate
-     * - 2 request burst capacity
-     * - 3600 requests/day quota
+     * Rate limiting for the public auth endpoints is configured as stage-level
+     * method throttling in `deployOptions.methodOptions` above, not as a usage
+     * plan.
+     *
+     * Usage plan throttling is *per-client*: AWS applies it only to requests
+     * that carry an API key associated with the plan. These endpoints are
+     * deliberately unauthenticated and send no API key, so a usage plan would
+     * never have matched a single request - the limits looked enforced but were
+     * inert. Stage-level method throttling applies to all callers, which is what
+     * protecting an unauthenticated endpoint requires.
+     *
+     * https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-request-throttling.html
+     *
+     * Note this is a throughput limit, not a daily quota; daily quotas are only
+     * expressible per API key. For a hard ceiling on public traffic, put AWS WAF
+     * in front of the API.
      */
-    const publicEndpointsUsagePlan = new apigateway.UsagePlan(this, 'PublicEndpointsUsagePlan', {
-      name: 'Public Auth Endpoints Rate Limiting',
-      description: 'Rate limiting for public auth endpoints (1 req/sec as recommended by AWS)',
-      throttle: {
-        rateLimit: 1,      // 1 request per second sustained
-        burstLimit: 2,     // Allow 2 requests in initial burst
-      },
-      quota: {
-        limit: 3600,       // 3600 requests per hour (1 per second * 3600 seconds)
-        period: apigateway.Period.DAY,
-      },
-    });
-
-    /**
-     * Associate usage plan with API stage
-     * - Applies rate limits to callback and decider endpoints
-     */
-    publicEndpointsUsagePlan.addApiStage({
-      api: api,
-      stage: api.deploymentStage,
-      throttle: [
-        {
-          method: authCallbackMethod,
-          throttle: {
-            rateLimit: 1,
-            burstLimit: 2,
-          }
-        },
-        {
-          method: authDeciderMethod,
-          throttle: {
-            rateLimit: 1,
-            burstLimit: 2,
-          }
-        }
-      ]
-    });
 
     // ===========================
     // STATIC FILE ROUTES (S3 INTEGRATION)
@@ -557,12 +673,12 @@ export class SecureStaticSiteStack extends cdk.Stack {
           {
             statusCode: '200',
             responseParameters: {
-              'method.response.header.Content-Type': "'text/html'",
+              'method.response.header.Content-Type': "'text/html; charset=utf-8'",
               'method.response.header.X-Frame-Options': "'DENY'",
               'method.response.header.X-Content-Type-Options': "'nosniff'",
               'method.response.header.Strict-Transport-Security': "'max-age=31536000; includeSubDomains'",
-              'method.response.header.X-XSS-Protection': "'1; mode=block'",
-              'method.response.header.Cache-Control': "'no-cache, no-store, must-revalidate'",
+              'method.response.header.Referrer-Policy': "'no-referrer'",
+              'method.response.header.Cache-Control': "'no-store'",
             },
           },
         ],
@@ -579,7 +695,7 @@ export class SecureStaticSiteStack extends cdk.Stack {
             'method.response.header.X-Frame-Options': true,
             'method.response.header.X-Content-Type-Options': true,
             'method.response.header.Strict-Transport-Security': true,
-            'method.response.header.X-XSS-Protection': true,
+            'method.response.header.Referrer-Policy': true,
             'method.response.header.Cache-Control': true,
           },
         },
@@ -691,7 +807,12 @@ export class SecureStaticSiteStack extends cdk.Stack {
      * - Auto-deletes old files
      */
     new s3deploy.BucketDeployment(this, 'DeployStaticFiles', {
-      sources: [s3deploy.Source.asset(path.join(__dirname, '../frontend/src'))],
+      sources: [
+        // index.html is deployed separately so its Content-Security-Policy can
+        // be injected at synth time - see indexHtmlWithCsp().
+        s3deploy.Source.asset(FRONTEND_DIR, { exclude: ['index.html'] }),
+        s3deploy.Source.data('index.html', indexHtmlWithCsp()),
+      ],
       destinationBucket: staticFilesBucket,
       retainOnDelete: false,
     });
@@ -701,12 +822,14 @@ export class SecureStaticSiteStack extends cdk.Stack {
     // ===========================
 
     /**
-     * Cognito login URL
-     * - Authorization code grant flow
-     * - Redirects to /auth/callback after login
-     * - Requests email, openid, and profile scopes
+     * Login entry point.
+     *
+     * Always start a login here rather than at the Cognito hosted UI directly.
+     * The decider mints the OAuth `state` nonce and the matching cookie that
+     * /auth/callback requires; a hand-built hosted-UI URL carries no state and
+     * the callback will reject it.
      */
-    const cognitoLoginUrl = `https://${userPoolDomain.domainName}.auth.${this.region}.amazoncognito.com/login?response_type=code&client_id=${userPoolClient.userPoolClientId}&redirect_uri=${api.url}auth/callback&scope=email+openid+profile`;
+    const loginUrl = `${api.url}auth/decider`;
 
     /**
      * Custom Resource Lambda
@@ -716,22 +839,27 @@ export class SecureStaticSiteStack extends cdk.Stack {
      * - Ensures all URLs are consistent after deployment
      */
     const updateCognitoUrlsLambda = new lambda.Function(this, 'UpdateCognitoUrlsFunction', {
-      runtime: lambda.Runtime.PYTHON_3_11,
+      runtime: PYTHON_RUNTIME,
       handler: 'update_cognito_urls.handler',
       code: lambda.Code.fromAsset(path.join(__dirname, '../lambda')),
       timeout: cdk.Duration.minutes(5),
       environment: {
         ApiId: api.restApiId,
         ApiUrl: api.url,
-        CognitoLoginUrl: cognitoLoginUrl,
         UserPoolId: userPool.userPoolId,
         ClientId: userPoolClient.userPoolClientId,
         Region: this.region,
-        // Force update when any of these change
-        Timestamp: new Date().toISOString(),
+        StageName: api.deploymentStage.stageName,
       },
+      // No synth-time timestamp here. The trigger keys off
+      // `handler.currentVersion`, whose hash already covers this environment
+      // block, so it re-runs whenever the API URL or Cognito IDs change - which
+      // is exactly when it needs to. A timestamp made the template differ on
+      // every synth, which made `cdk diff` useless and republished a Lambda
+      // version plus re-ran the trigger on every no-op deploy.
       memorySize: 256,
       description: 'Updates API Gateway responses with correct Cognito URLs',
+      logGroup: makeLogGroup('UpdateCognitoUrlsLogGroup'),
     });
 
     /**
@@ -803,9 +931,9 @@ export class SecureStaticSiteStack extends cdk.Stack {
       description: 'Cognito User Pool Client ID',
     });
 
-    new cdk.CfnOutput(this, 'CognitoLoginUrl', {
-      value: cognitoLoginUrl,
-      description: 'Cognito hosted login URL',
+    new cdk.CfnOutput(this, 'LoginUrl', {
+      value: loginUrl,
+      description: 'Login entry point - starts the OAuth flow with a state nonce',
     });
 
     new cdk.CfnOutput(this, 'AutoConfigurationNote', {
@@ -819,7 +947,7 @@ export class SecureStaticSiteStack extends cdk.Stack {
     });
 
     new cdk.CfnOutput(this, 'RateLimitingNote', {
-      value: 'Public auth endpoints (/auth/callback, /auth/decider) limited to 1 req/sec with 2 burst capacity',
+      value: 'Public auth endpoints (/auth/callback, /auth/decider) throttled to 1 req/sec with 2 burst capacity',
       description: 'Rate limiting configuration for public endpoints',
     });
   }

@@ -192,7 +192,10 @@ def generate_policy(principal_id: str, effect: str, resource: str, context: Dict
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Lambda authorizer handler - validates sessions from DynamoDB."""
-    print(f"Authorizer event: {json.dumps(event, default=str)}")
+    # Never log the raw event. Its Cookie header contains the session ID, which
+    # is a bearer credential - anyone with read access to the log group could
+    # replay it. Log only the route being authorized.
+    print(f"Authorizing {event.get('httpMethod', '?')} {event.get('path', '?')}")
 
     try:
         # Check if this is a public route

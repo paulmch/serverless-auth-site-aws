@@ -1,3 +1,4 @@
+import html
 import json
 import os
 import time
@@ -10,21 +11,12 @@ from typing import Dict, Any
 import boto3
 from jose import jwt
 
+from oauth_state import OAUTH_STATE_COOKIE, parse_state
+from security_headers import HTML_CONTENT_SECURITY_POLICY, get_security_headers
+
 
 # DynamoDB client (initialized once for connection reuse)
 dynamodb = boto3.resource('dynamodb')
-
-
-def get_security_headers() -> Dict[str, str]:
-    """
-    Return security headers following OWASP best practices.
-    """
-    return {
-        'X-Frame-Options': 'DENY',
-        'X-Content-Type-Options': 'nosniff',
-        'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
-        'X-XSS-Protection': '1; mode=block',
-    }
 
 
 def exchange_code_for_tokens(code: str, redirect_uri: str) -> Dict[str, Any]:
@@ -92,9 +84,48 @@ def store_session(session_id: str, tokens: Dict[str, str], user_info: Dict[str, 
     print(f"Session stored for user: {user_info.get('email', 'unknown')}")
 
 
+def get_cookie(event: Dict[str, Any], name: str) -> str:
+    """Read a single cookie value from the request headers."""
+    headers = event.get('headers') or {}
+    cookie_header = headers.get('Cookie') or headers.get('cookie') or ''
+
+    for cookie in cookie_header.split(';'):
+        cookie = cookie.strip()
+        if cookie.startswith(f'{name}='):
+            return urllib.parse.unquote(cookie.split('=', 1)[1])
+
+    return ''
+
+
+def error_page(status_code: int, title: str, message: str) -> Dict[str, Any]:
+    """Render a minimal HTML error page."""
+    return {
+        'statusCode': status_code,
+        'headers': {
+            'Content-Type': 'text/html; charset=utf-8',
+            **get_security_headers(HTML_CONTENT_SECURITY_POLICY)
+        },
+        'body': f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>{html.escape(title)}</title>
+</head>
+<body>
+    <h1>{html.escape(title)}</h1>
+    <p>{message}</p>
+    <p><a href="/">Return to Home</a></p>
+</body>
+</html>"""
+    }
+
+
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Handle OAuth2 callback from Cognito."""
-    print(f"Auth callback event: {json.dumps(event, default=str)}")
+    # Never log the raw event. It carries the OAuth authorization code in the
+    # query string, which is redeemable for this user's tokens by anyone who can
+    # read the log group.
+    print("Auth callback invoked")
 
     try:
         # Extract query parameters
@@ -105,44 +136,41 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Handle errors from Cognito
         if error:
             error_description = query_params.get('error_description', 'Unknown error')
-            return {
-                'statusCode': 400,
-                'headers': {
-                    'Content-Type': 'text/html',
-                    'Cache-Control': 'no-cache, no-store, must-revalidate',
-                    **get_security_headers()
-                },
-                'body': f"""
-                    <!DOCTYPE html>
-                    <html>
-                    <head>
-                        <title>Authentication Error</title>
-                        <meta charset="utf-8">
-                        <style>
-                            body {{ font-family: Arial, sans-serif; text-align: center; padding: 50px; }}
-                            .error {{ color: #d32f2f; }}
-                            a {{ color: #1976d2; text-decoration: none; }}
-                        </style>
-                    </head>
-                    <body>
-                        <h1 class="error">Authentication Error</h1>
-                        <p>{error}: {error_description}</p>
-                        <p><a href="/">Return to Home</a></p>
-                    </body>
-                    </html>
-                """
-            }
+            # Escape before interpolating: both values come straight from the
+            # query string, so an attacker controls them.
+            return error_page(
+                400,
+                'Authentication Error',
+                f'{html.escape(error)}: {html.escape(error_description)}',
+            )
 
         # Validate code parameter
         if not code:
             return {
                 'statusCode': 400,
                 'headers': {
-                    'Content-Type': 'text/plain',
+                    'Content-Type': 'text/plain; charset=utf-8',
                     **get_security_headers()
                 },
                 'body': 'Missing authorization code'
             }
+
+        # Verify the OAuth state before spending the authorization code. The
+        # nonce must match the one the decider set in an HttpOnly cookie when it
+        # started this login, which is what prevents an attacker from completing
+        # a flow in someone else's browser using their own code.
+        state_valid, post_login_path = parse_state(
+            query_params.get('state', ''),
+            get_cookie(event, OAUTH_STATE_COOKIE),
+        )
+
+        if not state_valid:
+            print("OAuth state validation failed - rejecting callback")
+            return error_page(
+                400,
+                'Authentication Error',
+                'This sign-in link is invalid or has expired. Please start again.',
+            )
 
         # Build redirect URI (must match what was registered with Cognito)
         host = event['headers'].get('Host', 'localhost')
@@ -182,19 +210,28 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
             # Set only session_id cookie (HttpOnly - not accessible to JavaScript)
             # This is the ONLY cookie sent to the browser - tokens stay server-side
+            cookie_path = base_path or '/'
             session_ttl = 30 * 24 * 3600  # 30 days
-            session_cookie = f"session_id={session_id}; HttpOnly; Secure; SameSite=Lax; Path={base_path or '/'}; Max-Age={session_ttl}"
+            session_cookie = f"session_id={session_id}; HttpOnly; Secure; SameSite=Lax; Path={cookie_path}; Max-Age={session_ttl}"
 
-            # Redirect to home page
-            redirect_location = base_path if base_path else "/"
+            # The state nonce is single-use; expire it now that it has been spent.
+            clear_state_cookie = (
+                f"{OAUTH_STATE_COOKIE}=; HttpOnly; Secure; SameSite=Lax; "
+                f"Path={cookie_path}; Max-Age=0"
+            )
+
+            # Return the user to wherever they were headed before logging in.
+            # post_login_path came out of the signed-off state and is already
+            # constrained to a same-origin path.
+            redirect_location = f"{base_path}{post_login_path}" if base_path else post_login_path
+
             return {
                 'statusCode': 302,
                 'multiValueHeaders': {
-                    'Set-Cookie': [session_cookie]
+                    'Set-Cookie': [session_cookie, clear_state_cookie]
                 },
                 'headers': {
                     'Location': redirect_location,
-                    'Cache-Control': 'no-cache, no-store, must-revalidate',
                     **get_security_headers()
                 },
                 'body': ''
@@ -202,40 +239,18 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         except Exception as e:
             print(f"Token exchange error: {str(e)}")
-            return {
-                'statusCode': 500,
-                'headers': {
-                    'Content-Type': 'text/html',
-                    'Cache-Control': 'no-cache, no-store, must-revalidate',
-                    **get_security_headers()
-                },
-                'body': """
-                    <!DOCTYPE html>
-                    <html>
-                    <head>
-                        <title>Authentication Failed</title>
-                        <meta charset="utf-8">
-                        <style>
-                            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
-                            .error { color: #d32f2f; }
-                            a { color: #1976d2; text-decoration: none; }
-                        </style>
-                    </head>
-                    <body>
-                        <h1 class="error">Authentication Failed</h1>
-                        <p>Unable to complete the authentication process.</p>
-                        <p><a href="/">Try Again</a></p>
-                    </body>
-                    </html>
-                """
-            }
+            return error_page(
+                500,
+                'Authentication Failed',
+                'Unable to complete the authentication process.',
+            )
 
     except Exception as e:
         print(f"Auth callback error: {str(e)}")
         return {
             'statusCode': 500,
             'headers': {
-                'Content-Type': 'text/plain',
+                'Content-Type': 'text/plain; charset=utf-8',
                 **get_security_headers()
             },
             'body': 'Internal server error'

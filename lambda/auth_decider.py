@@ -9,21 +9,17 @@ from typing import Dict, Any, Optional
 import boto3
 from jose import jwt
 
+from oauth_state import (
+    OAUTH_STATE_COOKIE,
+    OAUTH_STATE_MAX_AGE,
+    build_state,
+    safe_redirect_path,
+)
+from security_headers import HTML_CONTENT_SECURITY_POLICY, get_security_headers
+
 
 # DynamoDB client (initialized once for connection reuse)
 dynamodb = boto3.resource('dynamodb')
-
-
-def get_security_headers() -> Dict[str, str]:
-    """
-    Return security headers following OWASP best practices.
-    """
-    return {
-        'X-Frame-Options': 'DENY',
-        'X-Content-Type-Options': 'nosniff',
-        'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
-        'X-XSS-Protection': '1; mode=block',
-    }
 
 
 def refresh_tokens(refresh_token: str) -> Dict[str, Any]:
@@ -145,9 +141,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     print(f"Auth decider event: {json.dumps({k: v for k, v in event.items() if k != 'headers'})}")
 
     try:
-        # Extract query parameters for redirect URL
+        # Extract query parameters for redirect URL. This value is attacker
+        # controllable, so it is constrained to a same-origin path before it is
+        # ever used to build a Location header.
         query_params = event.get('queryStringParameters') or {}
-        redirect_to = query_params.get('redirect_to', '/')
+        redirect_to = safe_redirect_path(query_params.get('redirect_to', '/'))
 
         # Get request context for building URLs
         host = event['headers'].get('Host', 'localhost')
@@ -217,7 +215,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         'statusCode': 302,
                         'headers': {
                             'Location': redirect_url,
-                            'Cache-Control': 'no-cache, no-store, must-revalidate',
                             **get_security_headers()
                         },
                         'body': ''
@@ -241,30 +238,28 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             return {
                 'statusCode': 500,
                 'headers': {
-                    'Content-Type': 'text/html',
-                    'Cache-Control': 'no-cache, no-store, must-revalidate',
-                    **get_security_headers()
+                    'Content-Type': 'text/html; charset=utf-8',
+                    **get_security_headers(HTML_CONTENT_SECURITY_POLICY)
                 },
-                'body': """
-                    <!DOCTYPE html>
-                    <html>
-                    <head>
-                        <title>Configuration Error</title>
-                        <style>
-                            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
-                            .error { color: #d32f2f; }
-                        </style>
-                    </head>
-                    <body>
-                        <h1 class="error">Configuration Error</h1>
-                        <p>Authentication system is not properly configured.</p>
-                    </body>
-                    </html>
-                """
+                'body': """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Configuration Error</title>
+</head>
+<body>
+    <h1>Configuration Error</h1>
+    <p>Authentication system is not properly configured.</p>
+</body>
+</html>"""
             }
 
         # Build redirect URI for Cognito callback
         redirect_uri = f"https://{host}{base_path}/auth/callback"
+
+        # Mint the OAuth state: a random nonce the callback will require, plus
+        # the destination to return the user to after login.
+        state_nonce, state_value = build_state(redirect_to)
 
         # Build Cognito authorization URL
         auth_params = urllib.parse.urlencode({
@@ -272,23 +267,30 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             'client_id': client_id,
             'redirect_uri': redirect_uri,
             'scope': 'openid email profile',
-            'state': urllib.parse.quote(redirect_to)  # Preserve original destination
+            'state': state_value,
         })
 
         cognito_url = f"https://{cognito_domain}.auth.{region}.amazoncognito.com/login?{auth_params}"
 
+        cookie_path = base_path or '/'
+
         # Clear the old session cookie when redirecting to login
         # This ensures a fresh session is created after re-authentication
-        clear_session_cookie = f"session_id=; HttpOnly; Secure; SameSite=Lax; Path={base_path or '/'}; Max-Age=0"
+        clear_session_cookie = f"session_id=; HttpOnly; Secure; SameSite=Lax; Path={cookie_path}; Max-Age=0"
+
+        # The nonce half of the state, for the callback to compare against.
+        state_cookie = (
+            f"{OAUTH_STATE_COOKIE}={state_nonce}; HttpOnly; Secure; SameSite=Lax; "
+            f"Path={cookie_path}; Max-Age={OAUTH_STATE_MAX_AGE}"
+        )
 
         return {
             'statusCode': 302,
             'multiValueHeaders': {
-                'Set-Cookie': [clear_session_cookie]
+                'Set-Cookie': [clear_session_cookie, state_cookie]
             },
             'headers': {
                 'Location': cognito_url,
-                'Cache-Control': 'no-cache, no-store, must-revalidate',
                 **get_security_headers()
             },
             'body': ''
@@ -299,7 +301,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return {
             'statusCode': 500,
             'headers': {
-                'Content-Type': 'text/plain',
+                'Content-Type': 'text/plain; charset=utf-8',
                 **get_security_headers()
             },
             'body': 'Internal server error'

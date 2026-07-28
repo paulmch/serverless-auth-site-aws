@@ -8,8 +8,16 @@ from unittest.mock import MagicMock, patch
 # Add lambda directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lambda'))
 
-# Set required environment variables before importing modules
+# Set required environment variables before importing modules.
+# The Lambda modules build boto3 clients at import time, so the region and
+# credentials must be present before the first `from authorizer import ...`.
+# The Lambda runtime sets both AWS_REGION and AWS_DEFAULT_REGION; botocore only
+# reads AWS_DEFAULT_REGION, so setting AWS_REGION alone raises NoRegionError.
 os.environ['AWS_REGION'] = 'us-east-1'
+os.environ['AWS_DEFAULT_REGION'] = 'us-east-1'
+os.environ.setdefault('AWS_ACCESS_KEY_ID', 'testing')
+os.environ.setdefault('AWS_SECRET_ACCESS_KEY', 'testing')
+os.environ.setdefault('AWS_SESSION_TOKEN', 'testing')
 os.environ['COGNITO_USER_POOL_ID'] = 'us-east-1_TestPool'
 os.environ['COGNITO_CLIENT_ID'] = 'test-client-id'
 os.environ['COGNITO_DOMAIN'] = 'test-domain'

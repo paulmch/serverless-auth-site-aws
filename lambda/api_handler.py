@@ -1,22 +1,7 @@
 import json
 from typing import Dict, Any
 
-
-def get_security_headers() -> Dict[str, str]:
-    """
-    Return security headers following OWASP best practices.
-
-    Note: CORS headers are not needed since frontend is served from
-    same API Gateway origin (same-origin policy applies).
-    """
-    return {
-        'X-Frame-Options': 'DENY',
-        'X-Content-Type-Options': 'nosniff',
-        'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
-        'X-XSS-Protection': '1; mode=block',
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-        'Pragma': 'no-cache'
-    }
+from security_headers import get_security_headers
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:

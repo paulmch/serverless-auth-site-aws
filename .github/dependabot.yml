@@ -1,0 +1,29 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # aws-cdk-lib and the aws-cdk CLI release in lockstep; updating them
+      # separately produces churn and occasional version-skew warnings.
+      aws-cdk:
+        patterns:
+          - aws-cdk
+          - aws-cdk-lib
+          - constructs
+
+  - package-ecosystem: pip
+    directory: /lambda
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: pip
+    directory: /tests
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

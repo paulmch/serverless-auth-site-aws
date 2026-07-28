@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Lambda tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Match the Lambda runtime the stack deploys (PYTHON_RUNTIME).
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: tests/requirements.txt
+
+      - name: Install test dependencies
+        run: pip install -r tests/requirements.txt
+
+      - name: Run tests
+        run: pytest --cov=lambda --cov-report=term-missing
+
+  typescript:
+    name: CDK synth
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # Fails if package-lock.json has drifted out of sync with package.json.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - uses: actions/setup-python@v5
+        with:
+          # The layer bundles with local pip when available, so synth does not
+          # need a Docker daemon here.
+          python-version: '3.13'
+
+      - name: Synthesize CloudFormation template
+        run: npm run synth -- --quiet
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    # Advisories in aws-cdk-lib's bundled dependencies cannot be resolved from
+    # this repo - they need an upstream release. Reported, not gating.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+      - run: npm audit --audit-level=high

@@ -4,14 +4,20 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Serverless Auth Site</title>
+    <!--
+      Sets <base> so relative asset URLs resolve correctly whether the page is
+      reached at /prod or /prod/ (without a trailing slash the browser would
+      resolve css/style.css against the root and miss the stage prefix).
+
+      This must run before the stylesheet link is parsed, so it has to be
+      inline. The Content-Security-Policy sent with this page whitelists it by
+      SHA-256 hash, which the CDK stack computes from this file at synth time -
+      editing the script below is safe, the hash follows automatically.
+    -->
     <script>
-        // Dynamically set base href to handle API Gateway stage prefix
-        (function() {
-            var path = window.location.pathname;
-            // Extract stage prefix (e.g., /prod or /prod/) and ensure trailing slash
-            var match = path.match(/^\/[^\/]+/);
-            var base = match ? match[0] + '/' : '/';
-            document.write('<base href="' + base + '">');
+        (function () {
+            var match = window.location.pathname.match(/^\/[^\/]+/);
+            document.write('<base href="' + (match ? match[0] + '/' : '/') + '">');
         })();
     </script>
     <link rel="stylesheet" href="css/style.css">
@@ -22,10 +28,8 @@
         <div id="user-info">
             <p>Loading user info...</p>
         </div>
-        <div id="logout-container" style="margin: 20px 0;">
-            <button id="logout-btn" onclick="logout()" style="padding: 10px 20px; cursor: pointer; background-color: #dc3545; color: white; border: none; border-radius: 4px; font-size: 14px;">
-                Logout
-            </button>
+        <div id="logout-container">
+            <button id="logout-btn" type="button">Logout</button>
         </div>
         <div id="api-response">
             <h2>API Response</h2>

@@ -1,40 +1,16 @@
-import json
+"""Post-deployment configuration for Cognito and API Gateway.
+
+This runs as a CDK ``triggers.Trigger`` handler, not as a CloudFormation custom
+resource: the trigger provider calls Lambda ``Invoke`` directly with no payload
+and reports success/failure from the invocation itself. It must therefore not
+speak the CloudFormation custom-resource response protocol (no ResponseURL,
+StackId or RequestId exist in the event) - raising on failure is how a trigger
+signals an error.
+"""
+
 import boto3
-import urllib3
 import os
-from typing import Dict, Any
-
-def send_response(event: Dict[str, Any], context: Any, response_status: str, response_data: Dict[str, Any] = None, reason: str = None) -> None:
-    """Send response back to CloudFormation."""
-    if response_data is None:
-        response_data = {}
-
-    response_body = {
-        'Status': response_status,
-        'Reason': reason or f'See CloudWatch Log Stream: {context.log_stream_name}',
-        'PhysicalResourceId': event.get('PhysicalResourceId', context.log_stream_name),
-        'StackId': event['StackId'],
-        'RequestId': event['RequestId'],
-        'LogicalResourceId': event['LogicalResourceId'],
-        'Data': response_data
-    }
-
-    response_body_str = json.dumps(response_body)
-
-    http = urllib3.PoolManager()
-    try:
-        response = http.request(
-            'PUT',
-            event['ResponseURL'],
-            body=response_body_str,
-            headers={
-                'Content-Type': 'application/json',
-                'Content-Length': str(len(response_body_str))
-            }
-        )
-        print(f"Response sent to CloudFormation: {response.status}")
-    except Exception as e:
-        print(f"Failed to send response to CloudFormation: {str(e)}")
+from typing import Any, Dict
 
 
 def update_cognito_user_pool_client(user_pool_id: str, client_id: str, api_url: str, region: str) -> None:
@@ -100,7 +76,7 @@ def update_cognito_user_pool_client(user_pool_id: str, client_id: str, api_url: 
         raise
 
 
-def update_gateway_responses(api_id: str, api_url: str, region: str) -> None:
+def update_gateway_responses(api_id: str, api_url: str, region: str, stage_name: str) -> None:
     """Update API Gateway responses to redirect to auth decider."""
     client = boto3.client('apigateway', region_name=region)
 
@@ -137,7 +113,7 @@ def update_gateway_responses(api_id: str, api_url: str, region: str) -> None:
         print("Deploying API changes...")
         deployment = client.create_deployment(
             restApiId=api_id,
-            stageName='prod',
+            stageName=stage_name,
             description='Updated Cognito redirect URLs'
         )
         print(f"Deployment created: {deployment['id']}")
@@ -147,32 +123,27 @@ def update_gateway_responses(api_id: str, api_url: str, region: str) -> None:
         raise
 
 
-def handler(event: Dict[str, Any], context: Any) -> None:
-    """Lambda function to update Cognito URLs in API Gateway responses and User Pool Client."""
-    print(f"Event received: {json.dumps(event, default=str)}")
+def handler(event: Dict[str, Any], context: Any) -> Dict[str, str]:
+    """Update Cognito callback URLs and API Gateway responses after deployment.
 
-    try:
-        api_id = os.environ['ApiId']
-        api_url = os.environ['ApiUrl']
-        # CognitoLoginUrl is passed but not used here - gateway responses redirect to /auth/decider
-        user_pool_id = os.environ['UserPoolId']
-        client_id = os.environ['ClientId']
-        region = os.environ['Region']
+    Invoked by the CDK trigger with an empty event. Any exception raised here
+    fails the invocation, which is how the trigger reports an error.
+    """
+    api_id = os.environ['ApiId']
+    api_url = os.environ['ApiUrl']
+    user_pool_id = os.environ['UserPoolId']
+    client_id = os.environ['ClientId']
+    region = os.environ['Region']
+    stage_name = os.environ['StageName']
 
-        print(f"Updating configurations for API {api_id}...")
+    print(f"Updating configurations for API {api_id}...")
 
-        # Update Cognito User Pool Client callback URLs
-        update_cognito_user_pool_client(user_pool_id, client_id, api_url, region)
+    # Update Cognito User Pool Client callback URLs
+    update_cognito_user_pool_client(user_pool_id, client_id, api_url, region)
 
-        # Update the gateway responses to redirect to auth decider
-        update_gateway_responses(api_id, api_url, region)
+    # Update the gateway responses to redirect to auth decider
+    update_gateway_responses(api_id, api_url, region, stage_name)
 
-        # Send success response
-        send_response(event, context, 'SUCCESS', {
-            'Message': f'Successfully updated configurations for API {api_id}'
-        })
-
-    except Exception as e:
-        error_message = f"Error in custom resource: {str(e)}"
-        print(error_message)
-        send_response(event, context, 'FAILED', reason=error_message)
+    message = f'Successfully updated configurations for API {api_id}'
+    print(message)
+    return {'Message': message}

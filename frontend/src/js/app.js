@@ -12,15 +12,32 @@ async function fetchUserInfo() {
         const response = await fetch(`${basePath}api/auth/user`, { credentials: 'include' });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
-        document.getElementById('user-info').innerHTML = `
-            <p><strong>Welcome, ${data.email}</strong></p>
-            <p>User ID: ${data.userId}</p>
-        `;
+        // Build with textContent rather than innerHTML: these values come from
+        // the user's Cognito profile, and an address containing markup would
+        // otherwise be parsed as HTML.
+        const welcome = document.createElement('p');
+        const strong = document.createElement('strong');
+        strong.textContent = `Welcome, ${data.email}`;
+        welcome.appendChild(strong);
+
+        const userId = document.createElement('p');
+        userId.textContent = `User ID: ${data.userId}`;
+
+        const userInfo = document.getElementById('user-info');
+        userInfo.replaceChildren(welcome, userId);
+
         document.getElementById('response-data').textContent = JSON.stringify(data, null, 2);
     } catch (error) {
-        document.getElementById('user-info').innerHTML = `<p style="color: #c0392b;">Error: ${error.message}</p>`;
-        document.getElementById('response-data').textContent = `Error: ${error.message}`;
+        showError(`Error: ${error.message}`);
     }
+}
+
+function showError(message) {
+    const paragraph = document.createElement('p');
+    paragraph.className = 'error';
+    paragraph.textContent = message;
+    document.getElementById('user-info').replaceChildren(paragraph);
+    document.getElementById('response-data').textContent = message;
 }
 
 async function logout() {
@@ -53,5 +70,9 @@ async function logout() {
         logoutBtn.textContent = 'Logout';
     }
 }
+
+// Wired here rather than with an inline onclick attribute, which the page's
+// Content-Security-Policy blocks.
+document.getElementById('logout-btn').addEventListener('click', logout);
 
 fetchUserInfo();
